@@ -9,10 +9,14 @@ from rl_modules.models import actor, critic
 from mpi_utils.normalizer import normalizer
 from her_modules.her import her_sampler
 
+import time
+
+# TODO: Test training with control from SB with MPI
 """
 ddpg with HER (MPI-version)
-
 """
+
+
 class ddpg_agent:
     def __init__(self, args, env, env_params):
         self.args = args
@@ -58,15 +62,18 @@ class ddpg_agent:
     def learn(self):
         """
         train the network
-
         """
         # start to collect samples
+        total_steps = 0
+        rollout_success_rate = 0
         for epoch in range(self.args.n_epochs):
+            steps_count = 0
+            t0 = time.time()
             for _ in range(self.args.n_cycles):
-                mb_obs, mb_ag, mb_g, mb_actions = [], [], [], []
+                mb_obs, mb_ag, mb_g, mb_actions, mb_successes = [], [], [], [], []
                 for _ in range(self.args.num_rollouts_per_mpi):
                     # reset the rollouts
-                    ep_obs, ep_ag, ep_g, ep_actions = [], [], [], []
+                    ep_obs, ep_ag, ep_g, ep_actions, ep_successes = [], [], [], [], []
                     # reset the environment
                     observation = self.env.reset()
                     obs = observation['observation']
@@ -76,10 +83,18 @@ class ddpg_agent:
                     for t in range(self.env_params['max_timesteps']):
                         with torch.no_grad():
                             input_tensor = self._preproc_inputs(obs, g)
-                            pi = self.actor_network(input_tensor)
-                            action = self._select_actions(pi)
+                            action = self._policy(input_tensor)
+                        if np.random.rand() < self.args.random_eps:
+                            unscaled_action = self.env.action_space.sample()
+                            action = self._scale_action(unscaled_action)
+                        else:
+                            unscaled_action = self._unscale_action(action)
+                        # Update the curriculum
+                        steps_count += 1
+                        total_steps += 1
+                        self.env.update_goal_tolerance(total_steps)
                         # feed the actions into the environment
-                        observation_new, _, _, info = self.env.step(action)
+                        observation_new, _, _, info = self.env.step(unscaled_action)
                         obs_new = observation_new['observation']
                         ag_new = observation_new['achieved_goal']
                         # append rollouts
@@ -87,6 +102,7 @@ class ddpg_agent:
                         ep_ag.append(ag.copy())
                         ep_g.append(g.copy())
                         ep_actions.append(action.copy())
+                        ep_successes.append(info['is_success'])
                         # re-assign the observation
                         obs = obs_new
                         ag = ag_new
@@ -96,50 +112,88 @@ class ddpg_agent:
                     mb_ag.append(ep_ag)
                     mb_g.append(ep_g)
                     mb_actions.append(ep_actions)
+                    mb_successes.append(ep_successes)
                 # convert them into arrays
                 mb_obs = np.array(mb_obs)
                 mb_ag = np.array(mb_ag)
                 mb_g = np.array(mb_g)
                 mb_actions = np.array(mb_actions)
+                mb_successes = np.array(mb_successes)
                 # store the episodes
                 self.buffer.store_episode([mb_obs, mb_ag, mb_g, mb_actions])
-                self._update_normalizer([mb_obs, mb_ag, mb_g, mb_actions])
+                if self.args.normalize_inputs:
+                    self._update_normalizer([mb_obs, mb_ag, mb_g, mb_actions])
                 for _ in range(self.args.n_batches):
                     # train the network
                     self._update_network()
                 # soft update
                 self._soft_update_target_network(self.actor_target_network, self.actor_network)
                 self._soft_update_target_network(self.critic_target_network, self.critic_network)
+                # update success rate
+                rollout_success_rate = np.mean(mb_successes)
             # start to do the evaluation
-            success_rate = self._eval_agent()
+            eval_success_rate = self._eval_agent()
+            t1 = time.time()
+            cycle_duration = t1 - t0
             if MPI.COMM_WORLD.Get_rank() == 0:
-                print('[{}] epoch is: {}, eval success rate is: {:.3f}'.format(datetime.now(), epoch, success_rate))
-                torch.save([self.o_norm.mean, self.o_norm.std, self.g_norm.mean, self.g_norm.std, self.actor_network.state_dict()], \
-                            self.model_path + '/model.pt')
+                print('[{}] epoch: {}, '
+                      'eval success rate: {:.3f}, '
+                      'rollout success rate: {:.3f}, '
+                      'steps/second: {:.3f}, total_steps: {}'.format(datetime.now(),
+                                                    epoch,
+                                                    eval_success_rate,
+                                                    rollout_success_rate,
+                                                    steps_count / cycle_duration, total_steps))
+                torch.save([self.o_norm.mean, self.o_norm.std, self.g_norm.mean, self.g_norm.std,
+                            self.actor_network.state_dict()], \
+                           self.model_path + '/model.pt')
 
     # pre_process the inputs
     def _preproc_inputs(self, obs, g):
-        obs_norm = self.o_norm.normalize(obs)
-        g_norm = self.g_norm.normalize(g)
-        # concatenate the stuffs
-        inputs = np.concatenate([obs_norm, g_norm])
+        if self.args.normalize_inputs:
+            obs_norm = self.o_norm.normalize(obs)
+            g_norm = self.g_norm.normalize(g)
+            # concatenate the stuffs
+            inputs = np.concatenate([obs_norm, g_norm])
+        else:
+            inputs = np.concatenate([obs, g])
         inputs = torch.tensor(inputs, dtype=torch.float32).unsqueeze(0)
         if self.args.cuda:
             inputs = inputs.cuda()
         return inputs
-    
-    # this function will choose action for the agent and do the exploration
-    def _select_actions(self, pi):
-        action = pi.cpu().numpy().squeeze()
-        # add the gaussian
-        action += self.args.noise_eps * self.env_params['action_max'] * np.random.randn(*action.shape)
-        action = np.clip(action, -self.env_params['action_max'], self.env_params['action_max'])
-        # random actions...
-        random_actions = np.random.uniform(low=-self.env_params['action_max'], high=self.env_params['action_max'], \
-                                            size=self.env_params['action'])
-        # choose if use the random actions
-        action += np.random.binomial(1, self.args.random_eps, 1)[0] * (random_actions - action)
+
+    def _policy(self, input_tensor, apply_noise=True):
+        action = self.actor_network(input_tensor).cpu().numpy().squeeze()
+        if apply_noise:
+            # TODO: Move noise parameters to arguments
+            mu = 0
+            sigma = np.array([0.00065, 0.00065, 0.00065, 0.025, 0.025, 0.025])
+            noise = np.random.normal(mu, sigma)
+            action += noise
+        action = np.clip(action, -1, 1)
         return action
+
+    # this function will choose action for the agent and do the exploration
+    # TODO: Remove this function, _policy used instead
+    # def _select_actions(self, pi):
+    #     action = pi.cpu().numpy().squeeze()
+    #     # add the gaussian
+    #     action += self.args.noise_eps * self.env_params['action_max'] * np.random.randn(*action.shape)
+    #     action = np.clip(action, -self.env_params['action_max'], self.env_params['action_max'])
+    #     # random actions...
+    #     random_actions = np.random.uniform(low=-self.env_params['action_max'], high=self.env_params['action_max'], \
+    #                                        size=self.env_params['action'])
+    #     # choose if use the random actions
+    #     action += np.random.binomial(1, self.args.random_eps, 1)[0] * (random_actions - action)
+    #     return action
+
+    def _scale_action(self, action):
+        low, high = self.env.action_space.low, self.env.action_space.high
+        return 2.0 * ((action - low) / (high - low)) - 1.0
+
+    def _unscale_action(self, scaled_action):
+        low, high = self.env.action_space.low, self.env.action_space.high
+        return low + (0.5 * (scaled_action + 1.0) * (high - low))
 
     # update the normalizer
     def _update_normalizer(self, episode_batch):
@@ -149,10 +203,10 @@ class ddpg_agent:
         # get the number of normalization transitions
         num_transitions = mb_actions.shape[1]
         # create the new buffer to store them
-        buffer_temp = {'obs': mb_obs, 
+        buffer_temp = {'obs': mb_obs,
                        'ag': mb_ag,
-                       'g': mb_g, 
-                       'actions': mb_actions, 
+                       'g': mb_g,
+                       'actions': mb_actions,
                        'obs_next': mb_obs_next,
                        'ag_next': mb_ag_next,
                        }
@@ -183,20 +237,28 @@ class ddpg_agent:
         transitions = self.buffer.sample(self.args.batch_size)
         # pre-process the observation and goal
         o, o_next, g = transitions['obs'], transitions['obs_next'], transitions['g']
+        # preproc_og clipping obs and g
         transitions['obs'], transitions['g'] = self._preproc_og(o, g)
         transitions['obs_next'], transitions['g_next'] = self._preproc_og(o_next, g)
         # start to do the update
-        obs_norm = self.o_norm.normalize(transitions['obs'])
-        g_norm = self.g_norm.normalize(transitions['g'])
-        inputs_norm = np.concatenate([obs_norm, g_norm], axis=1)
-        obs_next_norm = self.o_norm.normalize(transitions['obs_next'])
-        g_next_norm = self.g_norm.normalize(transitions['g_next'])
-        inputs_next_norm = np.concatenate([obs_next_norm, g_next_norm], axis=1)
+        if self.args.normalize_inputs:
+            obs_norm = self.o_norm.normalize(transitions['obs'])
+            g_norm = self.g_norm.normalize(transitions['g'])
+            inputs_norm = np.concatenate([obs_norm, g_norm], axis=1)
+            obs_next_norm = self.o_norm.normalize(transitions['obs_next'])
+            g_next_norm = self.g_norm.normalize(transitions['g_next'])
+            inputs_next_norm = np.concatenate([obs_next_norm, g_next_norm], axis=1)
+        else:
+            inputs_norm = np.concatenate([transitions['obs'], transitions['g']], axis=1)
+            obs_next = transitions['obs_next']
+            g_next = transitions['g_next']
+            inputs_next_norm = np.concatenate([obs_next, g_next], axis=1)
+        # TODO: Change name of inputs_next_norm as not always normalized
         # transfer them into the tensor
         inputs_norm_tensor = torch.tensor(inputs_norm, dtype=torch.float32)
         inputs_next_norm_tensor = torch.tensor(inputs_next_norm, dtype=torch.float32)
         actions_tensor = torch.tensor(transitions['actions'], dtype=torch.float32)
-        r_tensor = torch.tensor(transitions['r'], dtype=torch.float32) 
+        r_tensor = torch.tensor(transitions['r'], dtype=torch.float32)
         if self.args.cuda:
             inputs_norm_tensor = inputs_norm_tensor.cuda()
             inputs_next_norm_tensor = inputs_next_norm_tensor.cuda()
