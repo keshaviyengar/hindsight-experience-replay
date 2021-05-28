@@ -81,14 +81,15 @@ class ddpg_agent:
                     g = observation['desired_goal']
                     # start to collect samples
                     for t in range(self.env_params['max_timesteps']):
-                        with torch.no_grad():
-                            input_tensor = self._preproc_inputs(obs, g)
-                            action = self._policy(input_tensor)
                         if np.random.rand() < self.args.random_eps:
                             unscaled_action = self.env.action_space.sample()
                             action = self._scale_action(unscaled_action)
                         else:
-                            unscaled_action = self._unscale_action(action)
+                            with torch.no_grad():
+                                input_tensor = self._preproc_inputs(obs, g)
+                                action = self._policy(input_tensor)
+                                unscaled_action = self._unscale_action(action)
+
                         # Update the curriculum
                         steps_count += 1
                         total_steps += 1
@@ -165,11 +166,8 @@ class ddpg_agent:
     def _policy(self, input_tensor, apply_noise=True):
         action = self.actor_network(input_tensor).cpu().numpy().squeeze()
         if apply_noise:
-            # TODO: Move noise parameters to arguments
-            mu = 0
-            sigma = np.array([0.00065, 0.00065, 0.00065, 0.025, 0.025, 0.025])
-            noise = np.random.normal(mu, sigma)
-            action += noise
+            # Take action, unscale, add multivariate noise, scale and return
+            action = self._scale_action(self._apply_noise(self._unscale_action(action)))
         action = np.clip(action, -1, 1)
         return action
 
@@ -186,6 +184,14 @@ class ddpg_agent:
     #     # choose if use the random actions
     #     action += np.random.binomial(1, self.args.random_eps, 1)[0] * (random_actions - action)
     #     return action
+
+    def _apply_noise(self, unscaled_action):
+        # TODO: Move noise parameters to arguments
+        mu = 0
+        sigma = np.array([0.00065, 0.00065, 0.00065, 0.025, 0.025, 0.025])
+        noise = np.random.normal(mu, sigma)
+        unscaled_action += noise
+        return unscaled_action
 
     def _scale_action(self, action):
         low, high = self.env.action_space.low, self.env.action_space.high

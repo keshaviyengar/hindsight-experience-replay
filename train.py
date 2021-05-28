@@ -35,6 +35,9 @@ def launch(args):
             'N_ts': 200000, 'function': 'decay', 'set_tol': 0
         },
         'relative_q': True,
+        'joint_representation': 'trig',
+        'resample_joints': False,
+        'normalize_obs': False
     }
     # create the ddpg_agent, test relative decay curriculum
     env = gym.make(args.env_name, **exp_kwargs)
